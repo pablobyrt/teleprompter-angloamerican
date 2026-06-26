@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <meta name="apple-mobile-web-app-title" content="Teleprompter" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <link rel="manifest" href="manifest.json" />
+  <title>Teleprompter</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0a0a;
+      --ctrl-bg: #141414;
+      --accent: #e8a000;
+      --text: #ffffff;
+      --muted: #888;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    /* ── Panel de edición ── */
+    #editor {
+      background: var(--ctrl-bg);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    #editor textarea {
+      width: 100%;
+      min-height: 110px;
+      background: #1e1e1e;
+      color: #ddd;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 15px;
+      line-height: 1.5;
+      resize: none;
+      outline: none;
+      -webkit-appearance: none;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    button {
+      background: #2a2a2a;
+      color: var(--text);
+      border: none;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      transition: background .15s;
+    }
+    button:active { opacity: .7; }
+    button.accent { background: var(--accent); color: #000; }
+    button.active  { background: var(--accent); color: #000; }
+
+    .slider-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 1;
+      min-width: 140px;
+    }
+    .slider-group label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+    input[type=range] {
+      flex: 1;
+      accent-color: var(--accent);
+      height: 4px;
+    }
+
+    /* ── Stage del teleprompter ── */
+    #stage {
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+      cursor: pointer;
+    }
+
+    #guide {
+      position: absolute;
+      top: 50%;
+      left: 0; right: 0;
+      height: 1px;
+      background: #1e1e1e;
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    #runner {
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      padding: 0 5%;
+      will-change: transform;
+    }
+
+    #runner p {
+      font-size: 48px;
+      font-weight: 700;
+      line-height: 1.4;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    #runner p.placeholder { color: #333; font-weight: 400; font-size: 28px; }
+
+    /* Espejo */
+    #stage.mirror #runner { transform-origin: center top; transform: scaleX(-1); }
+
+    /* Tap-hint */
+    #tap-hint {
+      position: absolute;
+      bottom: 20px; left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255,255,255,.08);
+      color: var(--muted);
+      font-size: 12px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      pointer-events: none;
+      z-index: 2;
+      transition: opacity .4s;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Panel superior -->
+<div id="editor">
+  <textarea id="script" placeholder="Pega aquí el guion del vocero…" spellcheck="false"></textarea>
+
+  <div class="controls">
+    <button id="btnPlay" class="accent" onclick="togglePlay()">▶ INICIAR</button>
+    <button onclick="reset()">↺ REINICIAR</button>
+    <button id="btnMirror" onclick="toggleMirror()">⟺ ESPEJO</button>
+    <button onclick="toggleEditor()">▲ OCULTAR</button>
+  </div>
+
+  <div class="controls">
+    <div class="slider-group">
+      <label>Velocidad</label>
+      <input type="range" id="speed" min="1" max="10" value="3" />
+    </div>
+    <div class="slider-group">
+      <label>Fuente</label>
+      <input type="range" id="fontSize" min="24" max="96" value="48"
+             oninput="updateFont(this.value)" />
+    </div>
+  </div>
+</div>
+
+<!-- Stage -->
+<div id="stage" onclick="togglePlay()">
+  <div id="guide"></div>
+  <div id="runner">
+    <p class="placeholder">Pega tu guion arriba y toca ▶ INICIAR</p>
+  </div>
+  <div id="tap-hint">Toca para pausar / continuar</div>
+</div>
+
+<script>
+  // ── Estado ────────────────────────────────────────────────────────────────
+  let running   = false;
+  let y         = 0;          // posición actual (px desde arriba del runner)
+  let rafId     = null;
+  let lastTs    = null;
+  let loaded    = false;
+  let editorOpen = true;
+
+  const stage    = document.getElementById("stage");
+  const runner   = document.getElementById("runner");
+  const btnPlay  = document.getElementById("btnPlay");
+  const hint     = document.getElementById("tap-hint");
+
+  // ── Scroll loop (requestAnimationFrame) ───────────────────────────────────
+  function loop(ts) {
+    if (!running) return;
+    if (lastTs === null) lastTs = ts;
+    const dt = ts - lastTs;
+    lastTs = ts;
+
+    const speed = parseFloat(document.getElementById("speed").value);
+    y -= speed * dt * 0.05;   // ~px/frame independiente de fps
+
+    runner.style.top = y + "px";
+
+    // Fin de texto
+    const bottom = y + runner.offsetHeight;
+    if (bottom < 0) { pause(); return; }
+
+    rafId = requestAnimationFrame(loop);
+  }
+
+  // ── Controles ─────────────────────────────────────────────────────────────
+  function togglePlay() {
+    if (running) { pause(); return; }
+
+    if (!loaded) {
+      const text = document.getElementById("script").value.trim();
+      if (!text) return;
+      loadScript(text);
+    }
+    play();
+  }
+
+  function play() {
+    running = true;
+    lastTs  = null;
+    btnPlay.textContent = "⏸ PAUSAR";
+    btnPlay.classList.remove("accent");
+    btnPlay.style.background = "#555";
+    hint.style.opacity = "1";
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function pause() {
+    running = false;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    btnPlay.textContent = loaded ? "▶ CONTINUAR" : "▶ INICIAR";
+    btnPlay.style.background = "";
+    btnPlay.classList.add("accent");
+    hint.style.opacity = "0";
+  }
+
+  function reset() {
+    pause();
+    loaded = false;
+    y = stage.offsetHeight;          // fuera de pantalla por abajo
+    runner.style.top = y + "px";
+    runner.innerHTML = '<p class="placeholder">Pega tu guion arriba y toca ▶ INICIAR</p>';
+    btnPlay.textContent = "▶ INICIAR";
+    updateFont(document.getElementById("fontSize").value);
+  }
+
+  function loadScript(text) {
+    runner.innerHTML = `<p>${escapeHtml(text)}</p>`;
+    updateFont(document.getElementById("fontSize").value);
+    y = stage.offsetHeight;          // arranca justo debajo del stage
+    runner.style.top = y + "px";
+    loaded = true;
+  }
+
+  function toggleMirror() {
+    const btn = document.getElementById("btnMirror");
+    stage.classList.toggle("mirror");
+    btn.classList.toggle("active");
+  }
+
+  function toggleEditor() {
+    const editor = document.getElementById("editor");
+    const btn = event.target;
+    editorOpen = !editorOpen;
+    editor.style.display = editorOpen ? "" : "none";
+    btn.textContent = editorOpen ? "▲ OCULTAR" : "▼ MOSTRAR";
+  }
+
+  function updateFont(size) {
+    const p = runner.querySelector("p");
+    if (p) p.style.fontSize = size + "px";
+  }
+
+  // ── Teclado (desktop) ─────────────────────────────────────────────────────
+  document.addEventListener("keydown", e => {
+    if (e.code === "Space" && e.target.tagName !== "TEXTAREA") {
+      e.preventDefault();
+      togglePlay();
+    }
+    if (e.code === "ArrowUp")   document.getElementById("speed").stepUp();
+    if (e.code === "ArrowDown") document.getElementById("speed").stepDown();
+  });
+
+  // ── Utilidades ────────────────────────────────────────────────────────────
+  function escapeHtml(str) {
+    return str
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  // ── PWA Service Worker ────────────────────────────────────────────────────
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
+
+  // Ocultar hint tras 3s de inactividad
+  let hintTimer;
+  stage.addEventListener("pointerdown", () => {
+    clearTimeout(hintTimer);
+    hint.style.opacity = "1";
+    hintTimer = setTimeout(() => { hint.style.opacity = "0"; }, 3000);
+  });
+</script>
+</body>
+</html>
